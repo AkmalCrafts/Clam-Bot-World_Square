@@ -425,48 +425,61 @@ async function upgradeLegacyTeamPanelsForGuild(readyClient, guild) {
       }
 
       try {
-        const messages = await channel.messages.fetch({ limit: 15 });
-        const panelMessage = messages.find((message) => {
-          if (message.author.id !== readyClient.user.id) return false;
-          if (!message.components || message.components.length === 0) return false;
-
-          return message.components.some((row) => row.components.some((component) => component.customId === 'add_team_member'));
-        });
-
-        if (!panelMessage) {
-          continue;
-        }
-
-        const targetRowIndex = panelMessage.components.findIndex((row) => {
-          const hasAddMember = row.components.some((component) => component.customId === 'add_team_member');
-          const hasKick = row.components.some((component) => component.customId === 'kick_member_init');
-          return hasAddMember && !hasKick && row.components.length <= 2;
-        });
-
-        if (targetRowIndex === -1) {
-          continue;
-        }
-
-        const updatedRows = panelMessage.components.map((row, index) => {
-          const rowBuilder = ActionRowBuilder.from(row);
-          if (index === targetRowIndex) {
-            rowBuilder.addComponents(
-              new ButtonBuilder()
-                .setCustomId('kick_member_init')
-                .setLabel('🥾 Kick Member')
-                .setStyle(ButtonStyle.Primary)
-            );
-          }
-          return rowBuilder;
-        });
-
-        await panelMessage.edit({ components: updatedRows });
+        await upgradeLegacyTeamPanelInChannel(channel, readyClient.user.id);
       } catch (error) {
         console.error(`[TEAM-SYNC] Failed to upgrade legacy panel in channel ${channel.id}:`, error);
       }
     }
   } catch (error) {
     console.error(`[TEAM-SYNC] Failed guild-level panel upgrade in ${guild.id}:`, error);
+  }
+}
+
+async function upgradeLegacyTeamPanelInChannel(channel, botUserId) {
+  try {
+    if (!channel || channel.type !== ChannelType.GuildText) {
+      return { updated: false, reason: 'Target is not a guild text channel.' };
+    }
+
+    const messages = await channel.messages.fetch({ limit: 15 });
+    const panelMessage = messages.find((message) => {
+      if (message.author.id !== botUserId) return false;
+      if (!message.components || message.components.length === 0) return false;
+      return message.components.some((row) => row.components.some((component) => component.customId === 'add_team_member'));
+    });
+
+    if (!panelMessage) {
+      return { updated: false, reason: 'No team panel message found in the last 15 messages.' };
+    }
+
+    const targetRowIndex = panelMessage.components.findIndex((row) => {
+      const hasAddMember = row.components.some((component) => component.customId === 'add_team_member');
+      const hasKick = row.components.some((component) => component.customId === 'kick_member_init');
+      return hasAddMember && !hasKick && row.components.length <= 2;
+    });
+
+    if (targetRowIndex === -1) {
+      return { updated: false, reason: 'Panel is already upgraded or has no legacy two-button layout.' };
+    }
+
+    const updatedRows = panelMessage.components.map((row, index) => {
+      const rowBuilder = ActionRowBuilder.from(row);
+      if (index === targetRowIndex) {
+        rowBuilder.addComponents(
+          new ButtonBuilder()
+            .setCustomId('kick_member_init')
+            .setLabel('🥾 Kick Member')
+            .setStyle(ButtonStyle.Primary)
+        );
+      }
+      return rowBuilder;
+    });
+
+    await panelMessage.edit({ components: updatedRows });
+    return { updated: true, reason: 'Team panel upgraded successfully.' };
+  } catch (error) {
+    console.error(`[TEAM-SYNC] Failed to upgrade legacy panel in channel ${channel?.id || 'unknown'}:`, error);
+    return { updated: false, reason: 'Failed to edit panel due to an unexpected error.' };
   }
 }
 
@@ -1502,7 +1515,7 @@ async function handleCreateTeamModalSubmission(interaction) {
         .setTitle('🏰 Welcome to Your Team Headquarters!')
         .setDescription(
           [
-            '📌 **Roster Control:** Type `!add-member @player` to add teammates instantly without dealing with annoying IDs.',
+            "📌 **Roster Control:** Use the panel's **Add Member** button and enter a Discord User ID to add teammates.",
             "🥾 **Roster Management:** Use the blue **'Kick Member'** button on the panel above to boot anyone from the squad.",
             "💥 **Disbanding:** If you ever want to completely delete the team, channels, and roles, the Owner can press the red **'Disband Team'** button.",
             '🔊 **Private Voice:** Your dynamic team voice channel is private. Only players added to your team role can view or join it.',
@@ -2026,46 +2039,36 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    if (content.startsWith('!add-member')) {
-      const teamRole = resolveTeamRoleForChannel(message.guild, message.channel);
-      if (!teamRole || message.channel.type !== ChannelType.GuildText) {
-        await message.reply('❌ This command can only be used inside your team HQ text channel.');
+    if (content.startsWith('!refresh-team-panel')) {
+      const isStaff = CONFIG.staffRoleId && message.member.roles.cache.has(CONFIG.staffRoleId);
+      const canManageGuild = message.member.permissions.has(PermissionFlagsBits.ManageGuild);
+      if (!isStaff && !canManageGuild) {
+        await message.reply('❌ Only staff can run panel refresh commands.');
         return;
       }
 
-      if (!canManageSpecificTeam(message.member, teamRole)) {
-        await message.reply('❌ Only the Team Owner can manage the roster.');
+      const mentionedChannel = message.mentions.channels.first();
+      const targetChannel = mentionedChannel || message.channel;
+      if (!targetChannel || targetChannel.type !== ChannelType.GuildText) {
+        await message.reply('Usage: `!refresh-team-panel` in an HQ channel or `!refresh-team-panel #team-hq`.');
         return;
       }
 
-      const targetMember = message.mentions.members.first();
-      if (!targetMember) {
-        await message.reply('Usage: `!add-member @member`');
-        return;
+      const result = await upgradeLegacyTeamPanelInChannel(targetChannel, client.user.id);
+
+      const teamRole = resolveTeamRoleForChannel(message.guild, targetChannel);
+      if (teamRole) {
+        const teamChannels = await getTeamChannelsByRole(message.guild, teamRole.id);
+        const textChannel = teamChannels.find((channel) => channel.type === ChannelType.GuildText) || null;
+        const voiceChannel = teamChannels.find((channel) => channel.type === ChannelType.GuildVoice) || null;
+        await upsertTeamChannels(teamRole.id, textChannel?.id || targetChannel.id, voiceChannel?.id || null);
       }
 
-      if (targetMember.id === message.member.id) {
-        await message.reply('❌ You are already in your own team.');
-        return;
+      if (result.updated) {
+        await message.reply(`✅ Team panel refreshed in ${targetChannel}.`);
+      } else {
+        await message.reply(`ℹ️ No changes made in ${targetChannel}: ${result.reason}`);
       }
-
-      const existingTargetTeam = getMemberTeamRoles(targetMember).first();
-      if (existingTargetTeam && existingTargetTeam.id !== teamRole.id) {
-        await message.reply(`${targetMember.user.tag} is already in ${existingTargetTeam.name}. Members can only be in one team.`);
-        return;
-      }
-
-      if (targetMember.roles.cache.has(teamRole.id)) {
-        await message.reply(`${targetMember.user.tag} is already in ${teamRole.name}.`);
-        return;
-      }
-
-      await targetMember.roles.add(teamRole, `Added to ${teamRole.name} by ${message.author.tag}`);
-      await clearMemberTeamChannelOverwrite(message.guild, teamRole.id, targetMember.id);
-      await upsertTeamRosterMember(teamRole.id, targetMember.id, targetMember.user.tag, message.author.id);
-
-      await message.reply(`➕ Added ${targetMember} to the team roster!`);
-      await message.channel.send({ content: `👋 Welcome ${targetMember} to the team!` });
       return;
     }
 
@@ -2282,10 +2285,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        await interaction.reply({
-          content: 'Use `!add-member @member` inside this HQ channel to add teammates instantly.',
-          ephemeral: true,
-        });
+        const modal = new ModalBuilder()
+          .setCustomId('add_member_modal')
+          .setTitle('Invite Squad Member');
+
+        const memberIdInput = new TextInputBuilder()
+          .setCustomId('member_id_input')
+          .setLabel("Enter Member's Discord User ID")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder('e.g., 462026...');
+
+        const row = new ActionRowBuilder().addComponents(memberIdInput);
+        modal.addComponents(row);
+
+        await interaction.showModal(modal);
         return;
       }
 
