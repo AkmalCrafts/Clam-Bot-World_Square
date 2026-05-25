@@ -142,6 +142,13 @@ function initializeDatabase() {
         PRIMARY KEY (team_role_id, user_id)
       );
 
+      CREATE TABLE IF NOT EXISTS team_channels (
+        team_role_id TEXT PRIMARY KEY,
+        text_channel_id TEXT,
+        voice_channel_id TEXT,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS app_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -341,6 +348,136 @@ async function removeTeamRosterByRole(teamRoleId) {
       .run(teamRoleId);
   } catch (error) {
     console.error('[TEAM-ROSTER] Failed to purge team roster by role:', error);
+  }
+}
+
+async function upsertTeamChannels(teamRoleId, textChannelId, voiceChannelId) {
+  try {
+    getDb()
+      .prepare(`
+        INSERT INTO team_channels (team_role_id, text_channel_id, voice_channel_id, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(team_role_id) DO UPDATE SET
+          text_channel_id = excluded.text_channel_id,
+          voice_channel_id = excluded.voice_channel_id,
+          updated_at = excluded.updated_at
+      `)
+      .run(teamRoleId, textChannelId || null, voiceChannelId || null, new Date().toISOString());
+  } catch (error) {
+    console.error('[TEAM-ROSTER] Failed to upsert team channels:', error);
+  }
+}
+
+async function removeTeamChannelsByRole(teamRoleId) {
+  try {
+    getDb()
+      .prepare('DELETE FROM team_channels WHERE team_role_id = ?')
+      .run(teamRoleId);
+  } catch (error) {
+    console.error('[TEAM-ROSTER] Failed to remove team channel mapping:', error);
+  }
+}
+
+function getTrackedTeamChannels() {
+  try {
+    return getDb()
+      .prepare('SELECT team_role_id, text_channel_id, voice_channel_id FROM team_channels')
+      .all();
+  } catch (error) {
+    console.error('[TEAM-SYNC] Failed to load tracked team channels:', error);
+    return [];
+  }
+}
+
+async function backfillTeamChannelMappingsForGuild(guild) {
+  try {
+    const trackedIds = new Set(getTrackedTeamChannels().map((row) => row.team_role_id));
+    const rosterTeams = getDb()
+      .prepare('SELECT DISTINCT team_role_id FROM team_roster')
+      .all()
+      .map((row) => row.team_role_id);
+
+    for (const teamRoleId of rosterTeams) {
+      if (trackedIds.has(teamRoleId)) continue;
+
+      const teamRole = guild.roles.cache.get(teamRoleId)
+        || (await guild.roles.fetch(teamRoleId).catch(() => null));
+      if (!teamRole) continue;
+
+      const teamChannels = await getTeamChannelsByRole(guild, teamRoleId);
+      const textChannel = teamChannels.find((channel) => channel.type === ChannelType.GuildText)
+        || null;
+      const voiceChannel = teamChannels.find((channel) => channel.type === ChannelType.GuildVoice)
+        || null;
+
+      if (!textChannel && !voiceChannel) continue;
+      await upsertTeamChannels(teamRoleId, textChannel?.id || null, voiceChannel?.id || null);
+    }
+  } catch (error) {
+    console.error(`[TEAM-SYNC] Failed to backfill team channel mappings for guild ${guild.id}:`, error);
+  }
+}
+
+async function upgradeLegacyTeamPanelsForGuild(readyClient, guild) {
+  try {
+    await backfillTeamChannelMappingsForGuild(guild);
+    const tracked = getTrackedTeamChannels();
+
+    for (const team of tracked) {
+      if (!team.text_channel_id) continue;
+
+      let channel = guild.channels.cache.get(team.text_channel_id);
+      if (!channel) {
+        channel = await guild.channels.fetch(team.text_channel_id).catch(() => null);
+      }
+
+      if (!channel || channel.type !== ChannelType.GuildText) {
+        continue;
+      }
+
+      try {
+        const messages = await channel.messages.fetch({ limit: 15 });
+        const panelMessage = messages.find((message) => {
+          if (message.author.id !== readyClient.user.id) return false;
+          if (!message.components || message.components.length === 0) return false;
+
+          return message.components.some((row) => row.components.some((component) => component.customId === 'add_team_member'));
+        });
+
+        if (!panelMessage) {
+          continue;
+        }
+
+        const targetRowIndex = panelMessage.components.findIndex((row) => {
+          const hasAddMember = row.components.some((component) => component.customId === 'add_team_member');
+          const hasKick = row.components.some((component) => component.customId === 'kick_member_init');
+          return hasAddMember && !hasKick && row.components.length === 2;
+        });
+
+        if (targetRowIndex === -1) {
+          continue;
+        }
+
+        const updatedRows = panelMessage.components.map((row, index) => {
+          const rowBuilder = ActionRowBuilder.from(row);
+          if (index === targetRowIndex) {
+            rowBuilder.addComponents(
+              new ButtonBuilder()
+                .setCustomId('kick_member_init')
+                .setLabel('🥾 Kick Member')
+                .setStyle(ButtonStyle.Primary)
+            );
+          }
+          return rowBuilder;
+        });
+
+        await panelMessage.edit({ components: updatedRows });
+      } catch (error) {
+        console.error(`[TEAM-SYNC] Failed to upgrade legacy panel in channel ${channel.id}:`, error);
+      }
+    }
+  } catch (error) {
+    console.error(`[TEAM-SYNC] Failed guild-level panel upgrade in ${guild.id}:`, error);
   }
 }
 
@@ -893,6 +1030,7 @@ async function autoCleanupEmptyTeam(guild, teamRole) {
   }
 
   await removeTeamRosterByRole(teamRole.id);
+  await removeTeamChannelsByRole(teamRole.id);
 
   await teamRole.delete('Auto-cleanup: Team has no members').catch((error) => {
     console.error(`[TEAM-SYSTEM] Failed to delete role ${teamRole.id} during auto-cleanup:`, error);
@@ -955,6 +1093,7 @@ async function handleDisbandTeam(interaction) {
       }
     }
 
+    await removeTeamChannelsByRole(teamRole.id);
     await removeTeamRosterByRole(teamRole.id);
 
     // Delete all team channels
@@ -1327,6 +1466,8 @@ async function handleCreateTeamModalSubmission(interaction) {
         ],
         reason: `Private team voice channel for ${teamRoleName}`,
       });
+
+      await upsertTeamChannels(newTeamRole.id, createdTextChannel.id, createdVoiceChannel.id);
 
       await interaction.editReply({
         content: `Success! Your team '${teamRoleName}' has been registered, your role assigned, and your private channels created.`,
@@ -1722,6 +1863,10 @@ function formatMinecraftRelayPreview(message) {
 client.once(Events.ClientReady, async (readyClient) => {
   try {
     console.log(`[BOOT] Logged in as ${readyClient.user.tag} (${readyClient.user.id})`);
+
+    for (const guild of readyClient.guilds.cache.values()) {
+      await upgradeLegacyTeamPanelsForGuild(readyClient, guild);
+    }
   } catch (error) {
     console.error('[BOOT] Error during ready initialization:', error);
   }
