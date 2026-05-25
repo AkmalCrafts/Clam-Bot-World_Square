@@ -17,6 +17,7 @@ const {
   PermissionFlagsBits,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
+  UserSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
 } = require('discord.js');
@@ -130,6 +131,15 @@ function initializeDatabase() {
         user_id TEXT NOT NULL,
         ign TEXT NOT NULL,
         processed_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS team_roster (
+        team_role_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        username TEXT,
+        added_by TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (team_role_id, user_id)
       );
 
       CREATE TABLE IF NOT EXISTS app_meta (
@@ -294,6 +304,43 @@ async function lockWhitelistTicket(channelId, userId, ign) {
   } catch (error) {
     console.error('[WHITELIST] Failed to lock whitelist ticket channel:', error);
     return false;
+  }
+}
+
+async function upsertTeamRosterMember(teamRoleId, userId, username, addedByUserId) {
+  try {
+    getDb()
+      .prepare(`
+        INSERT INTO team_roster (team_role_id, user_id, username, added_by, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(team_role_id, user_id) DO UPDATE SET
+          username = excluded.username,
+          added_by = excluded.added_by,
+          updated_at = excluded.updated_at
+      `)
+      .run(teamRoleId, userId, String(username || userId), String(addedByUserId || userId), new Date().toISOString());
+  } catch (error) {
+    console.error('[TEAM-ROSTER] Failed to upsert team roster member:', error);
+  }
+}
+
+async function removeTeamRosterMember(teamRoleId, userId) {
+  try {
+    getDb()
+      .prepare('DELETE FROM team_roster WHERE team_role_id = ? AND user_id = ?')
+      .run(teamRoleId, userId);
+  } catch (error) {
+    console.error('[TEAM-ROSTER] Failed to remove team roster member:', error);
+  }
+}
+
+async function removeTeamRosterByRole(teamRoleId) {
+  try {
+    getDb()
+      .prepare('DELETE FROM team_roster WHERE team_role_id = ?')
+      .run(teamRoleId);
+  } catch (error) {
+    console.error('[TEAM-ROSTER] Failed to purge team roster by role:', error);
   }
 }
 
@@ -727,6 +774,12 @@ function resolveTeamRoleForChannel(guild, channel) {
   return teamRoleFromName || null;
 }
 
+function canManageSpecificTeam(member, teamRole) {
+  if (!member || !('roles' in member) || !teamRole) return false;
+  if (!CONFIG.teamOwnerRoleId || !member.roles.cache.has(CONFIG.teamOwnerRoleId)) return false;
+  return member.roles.cache.has(teamRole.id);
+}
+
 /**
  * Handle modal submission that adds a member to the team associated with this channel.
  */
@@ -797,6 +850,7 @@ async function handleAddMemberModalSubmission(interaction) {
 
     await targetMember.roles.add(teamRole, `Added to ${teamRole.name} by ${interaction.user.tag}`);
     await clearMemberTeamChannelOverwrite(guild, teamRole.id, targetMember.id);
+    await upsertTeamRosterMember(teamRole.id, targetMember.id, targetMember.user.tag, interaction.user.id);
 
     await interaction.reply({
       content: `Added ${targetMember.user.tag} to ${teamRole.name} successfully.`,
@@ -837,6 +891,8 @@ async function autoCleanupEmptyTeam(guild, teamRole) {
       console.error(`[TEAM-SYSTEM] Failed to delete channel ${channel.id} during auto-cleanup:`, error);
     });
   }
+
+  await removeTeamRosterByRole(teamRole.id);
 
   await teamRole.delete('Auto-cleanup: Team has no members').catch((error) => {
     console.error(`[TEAM-SYSTEM] Failed to delete role ${teamRole.id} during auto-cleanup:`, error);
@@ -889,6 +945,7 @@ async function handleDisbandTeam(interaction) {
       if (member.roles.cache.has(teamRole.id)) {
         membersToNotify.push(member.user.username);
         await member.roles.remove(teamRole, `Team disbanded by ${interaction.user.tag}`).catch(() => null);
+        await removeTeamRosterMember(teamRole.id, member.id);
 
         // Remove owner role if they have no other teams
         const remainingTeams = getMemberTeamRoles(member).size;
@@ -897,6 +954,8 @@ async function handleDisbandTeam(interaction) {
         }
       }
     }
+
+    await removeTeamRosterByRole(teamRole.id);
 
     // Delete all team channels
     const teamChannels = await getTeamChannelsByRole(guild, teamRole.id);
@@ -974,6 +1033,7 @@ async function handleLeaveTeam(interaction) {
     await member.roles.remove(teamRole, `Left team via HQ by ${interaction.user.tag}`);
     await denyMemberInTeamChannels(guild, teamRole.id, member.id);
     await disconnectMemberFromTeamVoice(guild, teamRole.id, member.id);
+    await removeTeamRosterMember(teamRole.id, member.id);
 
     const hasAnyTeamLeft = getMemberTeamRoles(member).size > 0;
     if (!hasAnyTeamLeft && CONFIG.teamOwnerRoleId && member.roles.cache.has(CONFIG.teamOwnerRoleId)) {
@@ -993,6 +1053,92 @@ async function handleLeaveTeam(interaction) {
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({
         content: 'Something went wrong while leaving the team. Please try again.',
+        ephemeral: true,
+      });
+    }
+  }
+}
+
+async function handleKickMemberSelect(interaction) {
+  try {
+    const { guild, channel, member } = interaction;
+    if (!guild || !channel || !member || !('roles' in member)) {
+      await interaction.reply({
+        content: 'This action can only be used inside a team HQ channel.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const teamRole = resolveTeamRoleForChannel(guild, channel);
+    if (!teamRole || !canManageSpecificTeam(member, teamRole)) {
+      await interaction.reply({
+        content: '❌ Only the Team Owner can manage the roster.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const selectedUserId = interaction.values?.[0];
+    if (!selectedUserId) {
+      await interaction.reply({
+        content: 'No member was selected.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (selectedUserId === member.id) {
+      await interaction.reply({
+        content: '❌ You cannot kick yourself from your own team.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const targetMember = await guild.members.fetch(selectedUserId).catch(() => null);
+    if (!targetMember) {
+      await interaction.reply({
+        content: 'Could not find that member in this server.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (!targetMember.roles.cache.has(teamRole.id)) {
+      await interaction.reply({
+        content: `${targetMember.user.tag} is not in this team.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await targetMember.roles.remove(teamRole, `Kicked from ${teamRole.name} by ${interaction.user.tag}`);
+    await denyMemberInTeamChannels(guild, teamRole.id, targetMember.id);
+    await disconnectMemberFromTeamVoice(guild, teamRole.id, targetMember.id);
+    await removeTeamRosterMember(teamRole.id, targetMember.id);
+
+    const hasAnyTeamLeft = getMemberTeamRoles(targetMember).size > 0;
+    if (!hasAnyTeamLeft && CONFIG.teamOwnerRoleId && targetMember.roles.cache.has(CONFIG.teamOwnerRoleId)) {
+      await targetMember.roles.remove(CONFIG.teamOwnerRoleId, 'Removed Team Owner role after team kick');
+    }
+
+    await interaction.reply({
+      content: `🥾 Removed ${targetMember} from ${teamRole.name}.`,
+      ephemeral: true,
+    });
+
+    await channel.send({
+      content: `🥾 **Roster Update:** ${targetMember} has been kicked from the team by the Team Owner.`,
+    });
+
+    await autoCleanupEmptyTeam(guild, teamRole);
+  } catch (error) {
+    console.error('[TEAM-SYSTEM] Failed to process kick member selection:', error);
+
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({
+        content: 'Something went wrong while kicking this member. Please try again.',
         ephemeral: true,
       });
     }
@@ -1143,6 +1289,7 @@ async function handleCreateTeamModalSubmission(interaction) {
       });
 
       await member.roles.add(newTeamRole, `Assigned by dynamic team registration for ${teamRoleName}`);
+      await upsertTeamRosterMember(newTeamRole.id, member.id, member.user.tag, member.id);
 
       await member.roles.add(ownerRole.id, `Team owner granted for ${teamRoleName}`);
       ownerRoleAssigned = true;
@@ -1197,6 +1344,10 @@ async function handleCreateTeamModalSubmission(interaction) {
           .setLabel('➕ Add Member')
           .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
+          .setCustomId('kick_member_init')
+          .setLabel('🥾 Kick Member')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
           .setCustomId('disband_team')
           .setLabel('💥 Disband Team')
           .setStyle(ButtonStyle.Danger)
@@ -1214,6 +1365,24 @@ async function handleCreateTeamModalSubmission(interaction) {
               .setStyle(ButtonStyle.Secondary)
           ),
         ],
+      });
+
+      const tutorialEmbed = new EmbedBuilder()
+        .setColor(0xf1c40f)
+        .setTitle('🏰 Welcome to Your Team Headquarters!')
+        .setDescription(
+          [
+            '📌 **Roster Control:** Type `!add-member @player` to add teammates instantly without dealing with annoying IDs.',
+            "🥾 **Roster Management:** Use the blue **'Kick Member'** button on the panel above to boot anyone from the squad.",
+            "💥 **Disbanding:** If you ever want to completely delete the team, channels, and roles, the Owner can press the red **'Disband Team'** button.",
+            '🔊 **Private Voice:** Your dynamic team voice channel is private. Only players added to your team role can view or join it.',
+          ].join('\n\n')
+        )
+        .setTimestamp();
+
+      const tutorialMessage = await createdTextChannel.send({ embeds: [tutorialEmbed] });
+      await tutorialMessage.pin().catch((error) => {
+        console.error('[TEAM-SYSTEM] Failed to pin team tutorial message:', error);
       });
     } catch (creationError) {
       console.error('[TEAM-SYSTEM] Error while creating team resources:', creationError);
@@ -1723,6 +1892,49 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
+    if (content.startsWith('!add-member')) {
+      const teamRole = resolveTeamRoleForChannel(message.guild, message.channel);
+      if (!teamRole || message.channel.type !== ChannelType.GuildText) {
+        await message.reply('❌ This command can only be used inside your team HQ text channel.');
+        return;
+      }
+
+      if (!canManageSpecificTeam(message.member, teamRole)) {
+        await message.reply('❌ Only the Team Owner can manage the roster.');
+        return;
+      }
+
+      const targetMember = message.mentions.members.first();
+      if (!targetMember) {
+        await message.reply('Usage: `!add-member @member`');
+        return;
+      }
+
+      if (targetMember.id === message.member.id) {
+        await message.reply('❌ You are already in your own team.');
+        return;
+      }
+
+      const existingTargetTeam = getMemberTeamRoles(targetMember).first();
+      if (existingTargetTeam && existingTargetTeam.id !== teamRole.id) {
+        await message.reply(`${targetMember.user.tag} is already in ${existingTargetTeam.name}. Members can only be in one team.`);
+        return;
+      }
+
+      if (targetMember.roles.cache.has(teamRole.id)) {
+        await message.reply(`${targetMember.user.tag} is already in ${teamRole.name}.`);
+        return;
+      }
+
+      await targetMember.roles.add(teamRole, `Added to ${teamRole.name} by ${message.author.tag}`);
+      await clearMemberTeamChannelOverwrite(message.guild, teamRole.id, targetMember.id);
+      await upsertTeamRosterMember(teamRole.id, targetMember.id, targetMember.user.tag, message.author.id);
+
+      await message.reply(`➕ Added ${targetMember} to the team roster!`);
+      await message.channel.send({ content: `👋 Welcome ${targetMember} to the team!` });
+      return;
+    }
+
     if (content.startsWith('!whitelist-reset')) {
       const isStaff = CONFIG.staffRoleId && message.member.roles.cache.has(CONFIG.staffRoleId);
       const canManageGuild = message.member.permissions.has(PermissionFlagsBits.ManageGuild);
@@ -1765,6 +1977,7 @@ client.on(Events.MessageCreate, async (message) => {
       await member.roles.remove(existingMemberTeam, `Left team via command by ${message.author.tag}`);
       await denyMemberInTeamChannels(message.guild, existingMemberTeam.id, member.id);
       await disconnectMemberFromTeamVoice(message.guild, existingMemberTeam.id, member.id);
+      await removeTeamRosterMember(existingMemberTeam.id, member.id);
 
       const hasAnyTeamLeft = getMemberTeamRoles(member).size > 0;
       if (!hasAnyTeamLeft && CONFIG.teamOwnerRoleId && member.roles.cache.has(CONFIG.teamOwnerRoleId)) {
@@ -1860,6 +2073,13 @@ client.on(Events.MessageCreate, async (message) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    if (interaction.isUserSelectMenu()) {
+      if (interaction.customId === 'kick_member_select') {
+        await handleKickMemberSelect(interaction);
+        return;
+      }
+    }
+
     if (interaction.isStringSelectMenu()) {
       if (interaction.customId === 'ticket_type_select') {
         const ticketType = interaction.values[0];
@@ -1916,29 +2136,52 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (interaction.customId === 'add_team_member') {
         const member = interaction.member;
-        if (!member || !('roles' in member) || !CONFIG.teamOwnerRoleId || !member.roles.cache.has(CONFIG.teamOwnerRoleId)) {
+        const teamRole = interaction.guild && interaction.channel
+          ? resolveTeamRoleForChannel(interaction.guild, interaction.channel)
+          : null;
+
+        if (!teamRole || !canManageSpecificTeam(member, teamRole)) {
           await interaction.reply({
-            content: '❌ Only a Team Owner can add members.',
+            content: '❌ Only the Team Owner can manage the roster.',
             ephemeral: true,
           });
           return;
         }
 
-        const modal = new ModalBuilder()
-          .setCustomId('add_member_modal')
-          .setTitle('Invite Squad Member');
+        await interaction.reply({
+          content: 'Use `!add-member @member` inside this HQ channel to add teammates instantly.',
+          ephemeral: true,
+        });
+        return;
+      }
 
-        const memberIdInput = new TextInputBuilder()
-          .setCustomId('member_id_input')
-          .setLabel("Enter Member's Discord User ID")
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true)
-          .setPlaceholder('e.g., 462026...');
+      if (interaction.customId === 'kick_member_init') {
+        const member = interaction.member;
+        const teamRole = interaction.guild && interaction.channel
+          ? resolveTeamRoleForChannel(interaction.guild, interaction.channel)
+          : null;
 
-        const row = new ActionRowBuilder().addComponents(memberIdInput);
-        modal.addComponents(row);
+        if (!teamRole || !canManageSpecificTeam(member, teamRole)) {
+          await interaction.reply({
+            content: '❌ Only the Team Owner can manage the roster.',
+            ephemeral: true,
+          });
+          return;
+        }
 
-        await interaction.showModal(modal);
+        const selectRow = new ActionRowBuilder().addComponents(
+          new UserSelectMenuBuilder()
+            .setCustomId('kick_member_select')
+            .setPlaceholder('Select a teammate to kick')
+            .setMinValues(1)
+            .setMaxValues(1)
+        );
+
+        await interaction.reply({
+          content: 'Choose a teammate to remove from this team:',
+          components: [selectRow],
+          ephemeral: true,
+        });
         return;
       }
 
