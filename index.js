@@ -391,27 +391,16 @@ function getTrackedTeamChannels() {
 
 async function backfillTeamChannelMappingsForGuild(guild) {
   try {
-    const trackedIds = new Set(getTrackedTeamChannels().map((row) => row.team_role_id));
-    const rosterTeams = getDb()
-      .prepare('SELECT DISTINCT team_role_id FROM team_roster')
-      .all()
-      .map((row) => row.team_role_id);
+    await guild.roles.fetch().catch(() => null);
+    const teamRoles = guild.roles.cache.filter((role) => role.name.startsWith('Team '));
 
-    for (const teamRoleId of rosterTeams) {
-      if (trackedIds.has(teamRoleId)) continue;
-
-      const teamRole = guild.roles.cache.get(teamRoleId)
-        || (await guild.roles.fetch(teamRoleId).catch(() => null));
-      if (!teamRole) continue;
-
-      const teamChannels = await getTeamChannelsByRole(guild, teamRoleId);
-      const textChannel = teamChannels.find((channel) => channel.type === ChannelType.GuildText)
-        || null;
-      const voiceChannel = teamChannels.find((channel) => channel.type === ChannelType.GuildVoice)
-        || null;
+    for (const teamRole of teamRoles.values()) {
+      const teamChannels = await getTeamChannelsByRole(guild, teamRole.id);
+      const textChannel = teamChannels.find((channel) => channel.type === ChannelType.GuildText) || null;
+      const voiceChannel = teamChannels.find((channel) => channel.type === ChannelType.GuildVoice) || null;
 
       if (!textChannel && !voiceChannel) continue;
-      await upsertTeamChannels(teamRoleId, textChannel?.id || null, voiceChannel?.id || null);
+      await upsertTeamChannels(teamRole.id, textChannel?.id || null, voiceChannel?.id || null);
     }
   } catch (error) {
     console.error(`[TEAM-SYNC] Failed to backfill team channel mappings for guild ${guild.id}:`, error);
@@ -451,7 +440,7 @@ async function upgradeLegacyTeamPanelsForGuild(readyClient, guild) {
         const targetRowIndex = panelMessage.components.findIndex((row) => {
           const hasAddMember = row.components.some((component) => component.customId === 'add_team_member');
           const hasKick = row.components.some((component) => component.customId === 'kick_member_init');
-          return hasAddMember && !hasKick && row.components.length === 2;
+          return hasAddMember && !hasKick && row.components.length <= 2;
         });
 
         if (targetRowIndex === -1) {
